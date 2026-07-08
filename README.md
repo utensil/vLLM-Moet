@@ -107,9 +107,7 @@ codes (same stack, byte‑identical dense/scales/headers), so any delta is the q
 alone — see [docs/quality.md](docs/quality.md). The QUANT_PROBE study (identical quant scheme
 and cubins): MTP acceptance 2.73 vs 2.68 FP4 reference, draft accept 86.3% vs 84.1%, 12/12
 coherent greedy outputs; bare 2‑bit agrees with FP4 on 89% of next‑token picks — the delta
-cache + gate close that gap. Live serving reproduces the acceptance (~2.6 tok/step);
-long‑context (512K needle) re‑validation and standardized functional evals (HumanEval/GSM8K)
-remain TODO.
+cache + gate close that gap. Live serving reproduces the acceptance (~2.6 tok/step).
 
 ## Next: GLM‑5.2
 
