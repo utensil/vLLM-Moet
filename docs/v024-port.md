@@ -49,6 +49,17 @@ Environment pins that go with the patch (both required on SM120):
 - `moe_w2_*` utils are shape‑generic now: layer cutoff from `num_hidden_layers` (43 DS4 / 78
   GLM‑5.2), cubins probed for K∈{6144,4096,2048,1024,512}, workspaces sized from the model's
   hidden size (GLM‑5.x H=6144 supported; `kernels/` ships the K=6144 family).
+- `modelopt.py` (`ModelOptNvFp4FusedMoE`) — NVFP4 checkpoint path (**GLM‑5.2‑NVFP4**): same
+  three hooks; the loader dequantizes modelopt NVFP4 (e2m1 codes + f8e4m3 block‑16 scales +
+  per‑tensor `weight_scale_2`) to f64 — exact, all three factors representable — and
+  re‑quantizes to the sign‑symmetric codebook (`nvfp4_to_codes_scales`; the UE8M0 block‑32
+  output scales absorb `scale_2`). Golden‑tested EXACT on real checkpoint shards; forward
+  op‑validated through the K=6144/K=2048 cubins on real weights.
+- MTP under **pipeline parallelism** (ported from the fork, inert off‑PP/off‑spec): draft‑token
+  broadcast to rank 0 under async scheduling, `output_token_ids` trim on all ranks, and the
+  drafter `embed_tokens` share across PP ranks (the NVFP4/DS4 MTP head ships no embedding of
+  its own; upstream's share is gated to `pp_world_size == 1`). Validated on DS4‑Flash PP4
+  (4× RTX 5090): acceptance to 2.81, 184 vs 93 tok/s (~2× MTP speedup).
 
 Everything stays **opt‑in** (`VLLM_MOE_W2=1` etc.); with the knobs off the only behavioural
 delta vs stock v0.24.0 are the SM120 fixes above.

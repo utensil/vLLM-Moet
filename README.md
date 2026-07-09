@@ -121,13 +121,21 @@ and cubins): MTP acceptance 2.73 vs 2.68 FP4 reference, draft accept 86.3% vs 84
 coherent greedy outputs; bare 2‑bit agrees with FP4 on 89% of next‑token picks — the delta
 cache + gate close that gap. Live serving reproduces the acceptance (~2.6 tok/step).
 
-## Next: GLM‑5.2
+## GLM‑5.2: first live serving (bring‑up in progress)
 
-The port is GLM‑ready: the FP8→2‑bit load path is golden‑tested against the GLM‑5.2 sweep
-reference, the K=6144 GEMM family (GLM's hidden size) ships in `kernels/`, and the layer
-cutoff follows the model config (78 layers). The sign‑symmetric codebook finding reproduces on
-GLM‑5.2's weights (`internal` sweep, 180 tensors / 16 layers). Bring‑up starts when the
-checkpoint lands (~350 GB).
+**GLM‑5.2 (753B MoE) serves on 4× RTX PRO 6000** from the official
+[nvidia/GLM-5.2-NVFP4](https://huggingface.co/nvidia/GLM-5.2-NVFP4) checkpoint (433 GB): the
+loader re‑quantizes modelopt NVFP4 experts (e2m1 × e4m3 block‑16 × per‑tensor scale_2) to the
+same sign‑symmetric 2‑bit planes at load — f64‑exact vs the sweep reference on real shards —
+and serves through the K=6144/K=512 kernel family. Smoke status (TP4, 16K ctx, MTP/delta off):
+coherent EN/code/PL output, **56 tok/s** single‑stream decode with CUDA graphs, ~2.5k tok/s
+prefill. The sign‑symmetric codebook finding reproduces on GLM‑5.2's weights (`internal`
+sweep). MTP, the FP4 delta tier (the NVFP4 checkpoint provides an official FP4 source) and
+full benchmarks are next.
+
+MTP under **pipeline parallelism** also landed: the patch carries draft‑token propagation +
+drafter embedding share across PP ranks — DeepSeek‑V4‑Flash on 4× RTX 5090 **PP4** does
+184 tok/s with MTP vs 93 without (~2×), acceptance up to 2.81.
 
 ## The SM120 toolchain we built
 

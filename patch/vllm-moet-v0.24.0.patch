@@ -128,6 +128,84 @@ index 7cdb04cfb..64813139b 100644
          assert not self.is_monolithic
          assert self.moe_kernel is not None
          return self.moe_kernel.apply(
+diff --git a/vllm/model_executor/layers/quantization/modelopt.py b/vllm/model_executor/layers/quantization/modelopt.py
+index d51a2dd31..f4fa6a809 100644
+--- a/vllm/model_executor/layers/quantization/modelopt.py
++++ b/vllm/model_executor/layers/quantization/modelopt.py
+@@ -1421,6 +1421,12 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
+         self,
+         routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+     ) -> mk.FusedMoEPrepareAndFinalizeModular | None:
++        # VLLM_MOE_W2: the 2-bit path skips the stock kernel setup, so
++        # supports_internal_mk stays False and the runner's
++        # maybe_init_modular_kernel reaches this. Nothing to build (TP-only;
++        # apply() dispatches to moe_w2_forward) -> no-op instead of raising.
++        if getattr(self, "_moe_w2_active", False):
++            return None
+         raise ValueError(
+             f"{self.__class__.__name__} uses the new modular kernel initialization "
+             "logic. This function should not be called."
+@@ -1548,10 +1554,40 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
+         )
+         layer.register_parameter("w2_input_scale", w2_input_scale)
+ 
++        # VLLM_MOE_W2: the raw NVFP4 checkpoint experts of all layers do not
++        # fit the GPU during load (GLM-5.2-NVFP4 ~380 GiB); move the big
++        # tensors' storage to host RAM until the 2-bit planes are built in
++        # process_weights_after_loading. Mutating .data keeps the vLLM
++        # parameter classes and their loader attributes intact (scale_2 /
++        # input_scale are tiny and stay put).
++        from vllm.model_executor.layers.quantization.utils import moe_w2_cubit
++        if moe_w2_cubit.is_w2_layer(getattr(layer, "layer_name", "")):
++            for pname in ("w13_weight", "w13_weight_scale",
++                          "w2_weight", "w2_weight_scale"):
++                p_ = getattr(layer, pname)
++                p_.data = p_.data.cpu()
++
+     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+         """
+         Convert NVFP4 MoE weights into kernel format and setup the kernel.
+         """
++        # VLLM_MOE_W2: re-quantize the host-staged NVFP4 experts to 2-bit
++        # tensor-sym planes; skip the stock kernel setup entirely. Unlike the
++        # mxfp4/fp8 methods, this class raises in maybe_make_prepare_finalize
++        # (new-style internal-MK method) and its get_fused_moe_quant_config
++        # rebuilds a backend config from the (now stubbed) scale tensors — so
++        # pre-set a benign moe_quant_config (skips _ensure_moe_quant_config_
++        # init) and flag the method so maybe_make_prepare_finalize no-ops.
++        from vllm.model_executor.layers.quantization.utils import moe_w2_cubit
++        if moe_w2_cubit.is_w2_layer(getattr(layer, "layer_name", "")):
++            from vllm.model_executor.layers.fused_moe.config import (
++                FUSED_MOE_UNQUANTIZED_CONFIG)
++            key = len(moe_w2_cubit._LAYERS)
++            moe_w2_cubit.build_layer_planes_nvfp4(layer, key)
++            layer._moe_w2_key = key
++            self._moe_w2_active = True
++            self.moe_quant_config = FUSED_MOE_UNQUANTIZED_CONFIG
++            return
+ 
+         # Use a single gscale for w13.
+         if self.moe.is_act_and_mul and not torch.allclose(
+@@ -1655,6 +1691,19 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
+         shared_experts: SharedExperts | None,
+         shared_experts_input: torch.Tensor | None,
+     ) -> torch.Tensor:
++        # VLLM_MOE_W2 routed-expert path (cubit moe_w2_mm, 2-bit planes).
++        # Shared experts are orchestrated by the MoE runner (pre/post
++        # _maybe_apply_shared_experts); the non-modular w2 path returns only
++        # the routed-expert output, matching the other non-modular applies.
++        w2_key = getattr(layer, "_moe_w2_key", None)
++        if w2_key is not None:
++            from vllm.model_executor.layers.quantization.utils import (
++                moe_w2_cubit)
++            assert layer.expert_map is None and \
++                not layer.apply_router_weight_on_input
++            return moe_w2_cubit.moe_w2_forward(x, topk_weights, topk_ids,
++                                               w2_key)
++
+         assert not self.is_monolithic
+         assert self.moe_kernel is not None
+         return self.moe_kernel.apply(
 diff --git a/vllm/model_executor/layers/quantization/mxfp4.py b/vllm/model_executor/layers/quantization/mxfp4.py
 index 1b2a8a74b..3afdb16fd 100644
 --- a/vllm/model_executor/layers/quantization/mxfp4.py
@@ -207,10 +285,10 @@ index 32a2d8689..3e83d5a87 100644
              mn=r,
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
 new file mode 100644
-index 000000000..d238842b2
+index 000000000..f211cdf02
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
-@@ -0,0 +1,667 @@
+@@ -0,0 +1,753 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Routed experts on 2-bit tensor-sym planes (cubit moe_w2) for the
@@ -578,6 +656,92 @@ index 000000000..d238842b2
 +                  N13, K13, N2, K2, E,
 +                  ("w13_weight", f"w13_{scale_suffix}", "w2_weight",
 +                   f"w2_{scale_suffix}"))
++
++
++def build_layer_planes_nvfp4(layer, layer_key: int) -> None:
++    """NVFP4 (modelopt) checkpoint variant of build_layer_planes
++    (ModelOptNvFp4FusedMoE: nvidia/GLM-5.2-NVFP4 — e2m1 codes + e4m3
++    block-16 scales + per-tensor scale_2).
++
++    Reads the CPU-staged params (w13_weight [E,2I,H/2] u8 packed +
++    w13_weight_scale [E,2I,H/16] e4m3 + w13_weight_scale_2 [E,2] f32 etc.),
++    dequantizes each expert to f64 on GPU (exact) and re-quantizes to the
++    sweep-validated sign-symmetric 2-bit pipeline; the e2m1 nibbles of the
++    same requant feed the optional FP4 delta tier. The UE8M0 block-32 output
++    scales absorb scale_2, so serving needs no extra per-tensor factor.
++    """
++    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
++    from vllm.model_executor.layers.quantization.utils.moe_w2_planes import (
++        nvfp4_to_codes_scales, pack_fp4_fragment_major)
++
++    assert _ensure_ready(), "moe_w2 cubins missing"
++    dev = torch.device("cuda")
++    w13 = layer.w13_weight.data                 # [E, 2I, H/2] u8 (cpu)
++    s13 = layer.w13_weight_scale.data           # [E, 2I, H/16] e4m3
++    s13_2 = layer.w13_weight_scale_2.data       # [E, 2] f32 (w1, w3)
++    w2 = layer.w2_weight.data                   # [E, H, I/2] u8
++    s2 = layer.w2_weight_scale.data             # [E, H, I/16] e4m3
++    s2_2 = layer.w2_weight_scale_2.data         # [E] f32
++    assert w13.dtype == torch.uint8 and s13.dtype == torch.float8_e4m3fn, (
++        w13.dtype, s13.dtype)
++    E, N13, K13h = w13.shape
++    K13 = K13h * 2
++    _, N2, K2h = w2.shape
++    K2 = K2h * 2
++    group = K13 // s13.shape[2]                 # 16 for NVFP4
++    _require_kernels(K13, K2, need_w4=moe_w2_delta.enabled())
++
++    planes13 = torch.empty(E, N13 * K13 // 4, dtype=torch.uint8, device=dev)
++    sc13 = torch.empty(E, N13 * K13 // 32, dtype=torch.uint8, device=dev)
++    planes2 = torch.empty(E, N2 * K2 // 4, dtype=torch.uint8, device=dev)
++    sc2 = torch.empty(E, N2 * K2 // 32, dtype=torch.uint8, device=dev)
++
++    tier = moe_w2_delta.get_tier(n_experts=E, dev=dev,
++                                 w13_bytes=N13 * K13 // 2,
++                                 w2_bytes=N2 * K2 // 2)
++    fp13 = fp2 = None
++    if tier is not None:
++        fp13 = torch.empty(E, N13 * K13 // 2, dtype=torch.uint8, device=dev)
++        fp2 = torch.empty(E, N2 * K2 // 2, dtype=torch.uint8, device=dev)
++
++    # f64 temporaries are 16x the packed nibbles -> small H2D chunks,
++    # per-expert quantize (mirrors the fp8 loader).
++    chunk = 8
++    for e0 in range(0, E, chunk):
++        e1 = min(e0 + chunk, E)
++        wg = w13[e0:e1].to(dev, non_blocking=True)
++        sg = s13[e0:e1].to(dev, non_blocking=True)
++        s2g = s13_2[e0:e1].to(dev, non_blocking=True)
++        half = N13 // 2                          # rows [0:I]=w1, [I:2I]=w3
++        for i in range(e1 - e0):
++            s2_row = torch.cat((s2g[i, 0].expand(half), s2g[i, 1].expand(half)))
++            codes, sbytes, nib = nvfp4_to_codes_scales(
++                wg[i], sg[i], s2_row, group=group,
++                want_nibbles=fp13 is not None)
++            planes13[e0 + i] = pack_fragment_major(codes)
++            sc13[e0 + i] = pack_scales(sbytes)
++            if fp13 is not None:
++                fp13[e0 + i] = pack_fp4_fragment_major(nib)
++        wg = w2[e0:e1].to(dev, non_blocking=True)
++        sg = s2[e0:e1].to(dev, non_blocking=True)
++        s2g = s2_2[e0:e1].to(dev, non_blocking=True)
++        for i in range(e1 - e0):
++            codes, sbytes, nib = nvfp4_to_codes_scales(
++                wg[i], sg[i], s2g[i], group=group,
++                want_nibbles=fp2 is not None)
++            planes2[e0 + i] = pack_fragment_major(codes)
++            sc2[e0 + i] = pack_scales(sbytes)
++            if fp2 is not None:
++                fp2[e0 + i] = pack_fp4_fragment_major(nib)
++
++    if tier is not None:
++        tier.add_layer_host_planes(layer_key, fp13, fp2)
++        del fp13, fp2
++
++    _finish_layer(layer, layer_key, dev, planes13, sc13, planes2, sc2,
++                  N13, K13, N2, K2, E,
++                  ("w13_weight", "w13_weight_scale", "w2_weight",
++                   "w2_weight_scale"))
 +
 +
 +def _finish_layer(layer, layer_key, dev, planes13, sc13, planes2, sc2,
@@ -1756,10 +1920,10 @@ index 000000000..c2d518d2e
 +                fire_rate=(_n_fired / _n_steps if _n_steps else 0.0))
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_planes.py b/vllm/model_executor/layers/quantization/utils/moe_w2_planes.py
 new file mode 100644
-index 000000000..9affee365
+index 000000000..698df163f
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_planes.py
-@@ -0,0 +1,172 @@
+@@ -0,0 +1,225 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""2-bit tensor-sym expert planes for the 1-GPU DeepSeek-V4 plan.
@@ -1868,34 +2032,20 @@ index 000000000..9affee365
 +                         dtype=torch.float64)
 +
 +
-+def fp8_block_to_codes_scales(
-+    w_fp8: torch.Tensor,
-+    s_block: torch.Tensor,
-+    block: int = 128,
++def _f64_to_codes_scales(
++    w: torch.Tensor,
 +    want_nibbles: bool = False,
 +) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-+    """FP8 block-quant checkpoint expert -> (2-bit codes, UE8M0 scale bytes).
++    """Dequantized f64 weights [N, K] -> (2-bit codes, UE8M0 scale bytes).
 +
-+    GLM-5.2 / DS4-FP8 checkpoints carry float8_e4m3fn weights with f32
-+    block-128x128 scales instead of the mxfp4 codes the mxfp4 loader feeds
-+    the plane packers. Re-quantize on GPU with the sweep-validated pipeline
-+    (internal/glm52-sweep/sweep.py): dequant -> per-block-32 UE8M0 scale
-+    along K -> e2m1 snap -> tensor-sym {-4,-1,1,4} via _NIBBLE_TO_CODE.
-+
-+    All math is float64 (load-time only): the fp8 x f32-scale products and
-+    midpoint comparisons then match the f64 numpy prototype the sweep
-+    validated exactly, so ties break identically.
-+
-+    Returns (codes [N, K] u8 0..3, scale_bytes [N, K/32] u8 e8m0,
-+    nibbles [N, K] u8 e2m1 | None). `nibbles` (the FP4 "baseline" of the
-+    sweep) feeds the optional delta tier's FP4 planes.
++    The sweep-validated requant pipeline (internal/glm52-sweep/sweep.py):
++    per-block-32 UE8M0 scale along K -> e2m1 snap -> tensor-sym {-4,-1,1,4}
++    via _NIBBLE_TO_CODE. Load-time-only f64 math so midpoint comparisons and
++    tie-breaks match the numpy prototype the sweep validated exactly.
 +    """
-+    N, K = w_fp8.shape
++    assert w.dtype == torch.float64
++    N, K = w.shape
 +    assert K % 32 == 0
-+    w = w_fp8.double()
-+    sb = s_block.double()
-+    s = sb.repeat_interleave(block, 0)[:N].repeat_interleave(block, 1)[:, :K]
-+    w = w * s
 +    wb = w.view(N, K // 32, 32)
 +    amax = wb.abs().amax(dim=2)
 +    # UE8M0: power-of-2 scale mapping block amax onto e2m1 max (6.0). All-zero
@@ -1908,11 +2058,78 @@ index 000000000..9affee365
 +    scale_bytes = (exp + 127.0).to(torch.uint8)
 +    u = wb / torch.exp2(exp).unsqueeze(2)     # exact: power-of-2 division
 +    mag = torch.bucketize(u.abs().reshape(N, K),
-+                          _E2M1_MID.to(w_fp8.device)).to(torch.uint8)
++                          _E2M1_MID.to(w.device)).to(torch.uint8)
 +    neg = torch.signbit(u).reshape(N, K)
 +    nibbles = mag | (neg.to(torch.uint8) << 3)
-+    codes = _NIBBLE_TO_CODE.to(w_fp8.device)[nibbles.long()]
++    codes = _NIBBLE_TO_CODE.to(w.device)[nibbles.long()]
 +    return codes, scale_bytes, (nibbles if want_nibbles else None)
++
++
++def fp8_block_to_codes_scales(
++    w_fp8: torch.Tensor,
++    s_block: torch.Tensor,
++    block: int = 128,
++    want_nibbles: bool = False,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
++    """FP8 block-quant checkpoint expert -> (2-bit codes, UE8M0 scale bytes).
++
++    GLM-5.2 / DS4-FP8 checkpoints carry float8_e4m3fn weights with f32
++    block-128x128 scales instead of the mxfp4 codes the mxfp4 loader feeds
++    the plane packers. Dequantize to f64 and re-quantize with the
++    sweep-validated pipeline (_f64_to_codes_scales).
++
++    Returns (codes [N, K] u8 0..3, scale_bytes [N, K/32] u8 e8m0,
++    nibbles [N, K] u8 e2m1 | None). `nibbles` (the FP4 "baseline" of the
++    sweep) feeds the optional delta tier's FP4 planes.
++    """
++    N, K = w_fp8.shape
++    w = w_fp8.double()
++    sb = s_block.double()
++    s = sb.repeat_interleave(block, 0)[:N].repeat_interleave(block, 1)[:, :K]
++    return _f64_to_codes_scales(w * s, want_nibbles)
++
++
++# e2m1 nibble -> value (f64), for NVFP4 dequant: +[0,.5,1,1.5,2,3,4,6], then
++# the same magnitudes negated (nibble bit 3 = sign).
++_E2M1_VALS = torch.tensor(
++    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
++     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0], dtype=torch.float64)
++
++
++def nvfp4_to_codes_scales(
++    w_packed: torch.Tensor,
++    s_block: torch.Tensor,
++    s2: torch.Tensor,
++    group: int = 16,
++    want_nibbles: bool = False,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
++    """NVFP4 (modelopt) checkpoint expert -> (2-bit codes, UE8M0 scale bytes).
++
++    nvidia/GLM-5.2-NVFP4-style tensors: `weight` [N, K/2] u8 packed e2m1
++    pairs (low nibble = even k, same packing as mxfp4), `weight_scale`
++    [N, K/16] float8_e4m3fn block-16 scales, `weight_scale_2` per-tensor f32
++    (scalar, or [N] when the fused w13 carries distinct w1/w3 scale_2 —
++    pass it expanded per row). True weight = e2m1 * e4m3_scale * scale_2.
++
++    Dequantize to f64 (exact: all three factors are exactly representable)
++    and re-quantize with the sweep-validated pipeline (_f64_to_codes_scales).
++    The returned UE8M0 block-32 scales absorb scale_2, so the serving path
++    needs no extra per-tensor factor.
++    """
++    N, K2 = w_packed.shape
++    K = K2 * 2
++    assert s_block.shape == (N, K // group), (s_block.shape, N, K, group)
++    nib = mxfp4_to_nibbles(w_packed)                     # [N, K] u8
++    w = _E2M1_VALS.to(w_packed.device)[nib.long()]      # f64
++    s = s_block.double().repeat_interleave(group, dim=1)
++    w = w * s
++    s2 = s2.double().to(w.device)
++    if s2.dim() == 0 or s2.numel() == 1:
++        w = w * s2.reshape(())
++    else:
++        assert s2.shape == (N,), s2.shape
++        w = w * s2.view(N, 1)
++    return _f64_to_codes_scales(w, want_nibbles)
 +
 +
 +def pack_scales(scales: torch.Tensor) -> torch.Tensor:
@@ -2249,6 +2466,32 @@ index fe2b268cd..d56825ef8 100644
          )
          use_persistent_topk = current_platform.is_cuda() and topk_tokens in (
              512,
+diff --git a/vllm/models/deepseek_v4/nvidia/mtp.py b/vllm/models/deepseek_v4/nvidia/mtp.py
+index 64715deae..8c456a69a 100644
+--- a/vllm/models/deepseek_v4/nvidia/mtp.py
++++ b/vllm/models/deepseek_v4/nvidia/mtp.py
+@@ -40,6 +40,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
+ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+ from vllm.model_executor.models.deepseek_mtp import SharedHead
+ from vllm.model_executor.models.deepseek_v2 import get_spec_layer_idx_from_weight_name
++from vllm.model_executor.models.interfaces import SupportsPP
+ from vllm.model_executor.models.utils import maybe_prefix
+ from vllm.models.deepseek_v4.common.ops import (
+     fused_mtp_input_rmsnorm,
+@@ -257,7 +258,12 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
+         return logits
+ 
+ 
+-class DeepSeekV4MTP(nn.Module):
++class DeepSeekV4MTP(nn.Module, SupportsPP):
++    # The MTP drafter runs whole on the last PP rank (it consumes the target's
++    # local last-rank hidden state); it is never pipeline-split and never
++    # exchanges IntermediateTensors. Declaring SupportsPP only satisfies the
++    # generic verify_with_parallel_config gate so pipeline_parallel_size > 1 is
++    # allowed with MTP speculative decoding.
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
+         self.config = vllm_config.model_config.hf_config
 diff --git a/vllm/models/deepseek_v4/nvidia/ops/o_proj.py b/vllm/models/deepseek_v4/nvidia/ops/o_proj.py
 index 18e3b1056..d53669202 100644
 --- a/vllm/models/deepseek_v4/nvidia/ops/o_proj.py
@@ -3690,7 +3933,7 @@ index dad1777b4..1f4b8b92b 100644
                              # Join offloader's copy stream after forward to avoid
                              # unjoined stream error. The last layer's start_prefetch
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index 74938a823..83378c9b7 100644
+index 74938a823..f23e5317b 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
 @@ -4,6 +4,7 @@
@@ -3729,7 +3972,87 @@ index 74938a823..83378c9b7 100644
          self.mamba_state_idx: dict[str, int] = {}
          self._mamba_bufs: mamba_utils.MambaBuffers | None = None
          self.mamba_prev_last_scheduled_idx: CpuGpuBuffer | None = None
-@@ -4337,6 +4352,40 @@ class GPUModelRunner(
+@@ -1355,10 +1370,19 @@ class GPUModelRunner(
+                         req_state.output_token_ids.extend(
+                             new_token_ids[-num_new_tokens:]
+                         )
+-            elif num_output_tokens < len(req_state.output_token_ids):
+-                # Some output tokens were discarded due to a sync-KV-load
+-                # failure, or output_token_ids was inflated by the optimistic
+-                # extend above (async spec decode). Align the cached state.
++            # Trim any optimistic over-extend back to the authoritative
++            # scheduler count. On the last rank this also handles tokens
++            # discarded by a sync-KV-load failure. On non-last PP ranks (async
++            # spec decode) it undoes the optimistic extend above + the
++            # _pp_receive placeholder append, which are otherwise NEVER
++            # corrected there (the deferred correction is not applied on
++            # non-last ranks) -- left uncorrected, output_token_ids grows
++            # ~num_spec faster than num_computed every step, inflating
++            # num_tokens until the discard mask trips and the request is
++            # dropped from prev_req_id_to_index (-> stale [-1,...] input ->
++            # embedding assert). Runs on all ranks; it is a no-op (len already
++            # == count) in the non-async / non-spec paths.
++            if num_output_tokens < len(req_state.output_token_ids):
+                 del req_state.output_token_ids[num_output_tokens:]
+                 if req_index is not None:
+                     end_idx = (
+@@ -2473,8 +2497,11 @@ class GPUModelRunner(
+                 cm.slot_mapping = slot_mappings[kv_cache_gid]
+ 
+             if self.speculative_config and spec_decode_common_attn_metadata is None:
++                # The drafter only exists on the last PP rank; other ranks
++                # fall through to the non-eagle branch.
++                _drafter = getattr(self, "drafter", None)
+                 if isinstance(
+-                    self.drafter,
++                    _drafter,
+                     (
+                         EagleProposer,
+                         DFlashProposer,
+@@ -2482,16 +2509,20 @@ class GPUModelRunner(
+                         ExtractHiddenStatesProposer,
+                     ),
+                 ):
+-                    if self.drafter.kv_cache_gid == kv_cache_gid:
++                    if _drafter.kv_cache_gid == kv_cache_gid:
+                         spec_decode_common_attn_metadata = cm
+                 else:
+                     spec_decode_common_attn_metadata = cm
+             # Capture per-group block tables for multi-group proposers.
+-            if self.speculative_config and isinstance(self.drafter, Step3p5MTPProposer):
++            if self.speculative_config and isinstance(
++                getattr(self, "drafter", None), Step3p5MTPProposer
++            ):
+                 self.drafter.set_per_group_attn_metadata(
+                     kv_cache_gid, cm.block_table_tensor, cm.slot_mapping
+                 )
+-            elif self.speculative_config and isinstance(self.drafter, Gemma4Proposer):
++            elif self.speculative_config and isinstance(
++                getattr(self, "drafter", None), Gemma4Proposer
++            ):
+                 self.drafter.set_per_group_block_table(
+                     kv_cache_gid, cm.block_table_tensor
+                 )
+@@ -3560,6 +3591,18 @@ class GPUModelRunner(
+             intermediate_tensors = self.sync_and_gather_intermediate_tensors(
+                 num_input_tokens, intermediate_tensors, True
+             )
++            # Zero the padding rows (beyond the real scheduled tokens) of the
++            # received hidden states, mirroring the positions zeroing above.
++            # Under FULL cudagraph the graph is captured for the padded size
++            # and reads these rows; if they hold stale/non-deterministic data
++            # (the PP transfer copies the padded extent), row-coupled kernels
++            # can leak them into the real tokens' output -> non-deterministic
++            # decode on non-first PP ranks. Zeroing makes the captured input
++            # deterministic.
++            if num_input_tokens > num_scheduled_tokens:
++                assert self.intermediate_tensors is not None
++                for _k, _t in self.intermediate_tensors.items():
++                    _t[num_scheduled_tokens:num_input_tokens].zero_()
+ 
+         if is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
+             # Run the encoder, just like we do with other multimodal inputs.
+@@ -4337,6 +4380,40 @@ class GPUModelRunner(
                  **model_kwargs,
              )
  
@@ -3770,7 +4093,7 @@ index 74938a823..83378c9b7 100644
          with record_function_or_nullcontext("gpu_model_runner: postprocess"):
              if self.use_aux_hidden_state_outputs:
                  # True when EAGLE 3 is used.
-@@ -4395,6 +4444,92 @@ class GPUModelRunner(
+@@ -4395,6 +4472,92 @@ class GPUModelRunner(
                  assert broadcasted is not None
                  logits = broadcasted["logits"]
  
@@ -3863,7 +4186,7 @@ index 74938a823..83378c9b7 100644
          self.execute_model_state = ExecuteModelState(
              scheduler_output,
              logits,
-@@ -4416,6 +4551,95 @@ class GPUModelRunner(
+@@ -4416,6 +4579,95 @@ class GPUModelRunner(
  
          return None
  
@@ -3959,6 +4282,319 @@ index 74938a823..83378c9b7 100644
      def _input_fits_in_drafter(
          self, common_attn_metadata: CommonAttentionMetadata | None
      ) -> bool:
+@@ -4441,6 +4693,12 @@ class GPUModelRunner(
+             # receive sampled token ids from the last PP rank.
+             if self.use_async_scheduling and not get_pp_group().is_last_rank:
+                 self._pp_receive_prev_sampled_token_ids_to_input_batch()
++                # Spec decode: also receive the drafts (the drafter only runs
++                # on the last rank). Order matters -- this must follow the
++                # sampled receive to match the broadcast order on the last
++                # rank.
++                if self.num_spec_tokens > 0:
++                    self._pp_receive_draft_token_ids()
+             # In case of PP with kv transfer, we need to pass through the
+             # kv_connector_output
+             return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+@@ -4605,6 +4863,23 @@ class GPUModelRunner(
+             # tokens on the CPU, so they are run after bookkeeping.
+             propose_draft_token_ids(valid_sampled_token_ids)
+ 
++        # PP + async spec decode: the drafter ran only on this (last) rank,
++        # but the first rank embeds input_ids and needs the drafts to fill the
++        # spec positions. Broadcast them now (after they are proposed) so the
++        # next step's _prepare_input_ids scatters them into rank 0's input;
++        # otherwise rank 0 embeds stale tokens at the spec positions and every
++        # draft is rejected. Mirrors _pp_broadcast_prev_sampled_token_ids and
++        # must come after it to keep the device_group broadcasts ordered
++        # across ranks.
++        if (
++            self.use_async_scheduling
++            and not self.broadcast_pp_output
++            and self.num_spec_tokens > 0
++        ):
++            pp = get_pp_group()
++            if pp.world_size > 1 and pp.is_last_rank:
++                self._pp_broadcast_draft_token_ids()
++
+         # Finalize KV connector (wait_for_save + clear metadata) after
+         # draft model runs. Deferred from target model forward to allow
+         # draft model to also save its KV cache.
+@@ -4696,13 +4971,35 @@ class GPUModelRunner(
+     def _pp_broadcast_prev_sampled_token_ids(
+         self, sampled_token_ids: torch.Tensor
+     ) -> None:
+-        """Broadcast sampled token ids (GPU) from last PP stage"""
++        """Broadcast sampled token ids (GPU) from last PP stage.
++
++        For non-spec decode `sampled_token_ids` is [num_reqs, 1]. For
++        speculative decode it is [num_reqs, 1 + num_spec] with -1 in the
++        rejected tail; the next step's input needs the LAST ACCEPTED token per
++        request (the token the next forward must be conditioned on), so the
++        receiver reduces it to [num_reqs, 1]. This makes PP + async scheduling
++        work with MTP/spec decode (otherwise the prev accepted token is never
++        carried into the next step's input on non-last ranks).
++        """
+         pp = get_pp_group()
+         assert pp.is_last_rank
+-        # `prev_sampled_token_ids` is expected to have shape [num_reqs, 1].
+-        assert sampled_token_ids.dim() == 2 and sampled_token_ids.shape[-1] == 1, (
+-            "PP+async expects sampled_token_ids to have shape [num_reqs, 1]"
+-        )
++        assert sampled_token_ids.dim() == 2
++        # Broadcast a FIXED-width [num_reqs, 1 + num_spec] tensor (with -1 in
++        # the rejected tail) so the receiving ranks can recover both the last
++        # accepted token (for the next input) AND the per-request accepted
++        # count (for output-length bookkeeping). The sampled width varies by
++        # step (1 at prefill / no-draft, 1 + num_spec at spec decode), so pad
++        # to the fixed width the receivers allocate -- otherwise the
++        # collective sizes mismatch and the broadcast deadlocks.
++        sampled_token_ids = sampled_token_ids.to(torch.int32)
++        target_w = 1 + self.num_spec_tokens
++        if sampled_token_ids.shape[1] < target_w:
++            pad = sampled_token_ids.new_full(
++                (sampled_token_ids.shape[0], target_w - sampled_token_ids.shape[1]),
++                -1,
++            )
++            sampled_token_ids = torch.cat([sampled_token_ids, pad], dim=1)
++        sampled_token_ids = sampled_token_ids.contiguous()
+         # Skip for chunked prefill: sampled tokens are dummy
+         # and will be discarded, no need to broadcast.
+         if not self._is_all_reqs_chunked_prefill():
+@@ -4711,16 +5008,33 @@ class GPUModelRunner(
+             )
+ 
+     def _pp_receive_prev_sampled_token_ids_to_input_batch(self) -> None:
+-        """Receive sampled token ids broadcast from last PP stage"""
++        """Receive sampled token ids broadcast from last PP stage.
++
++        Receives the full [num_reqs, 1 + num_spec] tensor (with -1 in the
++        rejected tail). For spec decode, reduces it to the LAST ACCEPTED token
++        per request (what the next input must be conditioned on) and advances
++        each request's local output length by its accepted count (not a fixed
++        1), so positions stay consistent across PP ranks.
++        """
+         pp = get_pp_group()
+         assert not pp.is_last_rank
+         num_reqs = self.input_batch.num_reqs
+-        # `prev_sampled_token_ids` is expected to have shape [num_reqs, 1].
+-        recv = torch.empty((num_reqs, 1), dtype=torch.int32, device=self.device)
++        width = 1 + self.num_spec_tokens
++        recv = torch.empty((num_reqs, width), dtype=torch.int32, device=self.device)
+         # skip for chunked prefill.
+         if not self._is_all_reqs_chunked_prefill():
+             torch.distributed.broadcast(recv, src=pp.last_rank, group=pp.device_group)
+-        self.input_batch.prev_sampled_token_ids = recv
++
++        if width == 1:
++            counts_cpu = [1] * num_reqs
++            self.input_batch.prev_sampled_token_ids = recv
++        else:
++            # accepted count = number of non-(-1) entries per request (>= 1).
++            counts = (recv != -1).sum(dim=1)
++            last_idx = (counts - 1).clamp(min=0).unsqueeze(1)
++            last_tok = recv.gather(1, last_idx)  # [num_reqs, 1], last accepted
++            self.input_batch.prev_sampled_token_ids = last_tok
++            counts_cpu = counts.tolist()
+ 
+         # construct `prev_req_id_to_index` here so `_prepare_input_ids`
+         # can map req_id -> previous batch row
+@@ -4731,15 +5045,136 @@ class GPUModelRunner(
+             if i in discard_req_indices_set:
+                 continue
+             prev_req_id_to_index[req_id] = i
+-            # PP+async scheduling: advance per-request local cached output length by
+-            # appending a placeholder (-1) token id.
++            # PP+async scheduling: advance per-request local cached output
++            # length by appending one placeholder (-1) per accepted token this
++            # step.
+             if (req_state := self.requests.get(req_id)) is not None:
+-                req_state.output_token_ids.append(-1)
++                for _ in range(int(counts_cpu[i])):
++                    req_state.output_token_ids.append(-1)
+             pos = self.input_batch.num_tokens_no_spec[i]
+-            self.input_batch.is_token_ids[i, pos] = True
+-            self.input_batch.num_tokens_no_spec[i] = pos + 1
++            end = pos + int(counts_cpu[i])
++            self.input_batch.is_token_ids[i, pos:end] = True
++            self.input_batch.num_tokens_no_spec[i] = end
+         self.input_batch.prev_req_id_to_index = prev_req_id_to_index
+ 
++    def _pp_broadcast_draft_token_ids(self) -> None:
++        """Broadcast the just-proposed draft token ids (GPU) from the last PP
++        stage to all ranks.
++
++        Under PP the drafter (MTP/EAGLE) runs only on the last rank, but the
++        FIRST rank is the only rank that embeds ``input_ids`` -- so without
++        this it never sees the speculative tokens and embeds stale values at
++        the spec positions, yielding garbage hidden states and ~0% draft
++        acceptance. Broadcasting the drafts lets the next step's
++        ``_prepare_input_ids`` scatter them into rank 0's input exactly as the
++        co-located (TP / single-GPU) path does.
++
++        Paired with ``_pp_receive_draft_token_ids``. MUST be issued AFTER
++        ``_pp_broadcast_prev_sampled_token_ids`` so the two broadcasts on the
++        PP ``device_group`` stay in the same order on every rank.
++        """
++        pp = get_pp_group()
++        assert pp.is_last_rank
++        # Skip for chunked prefill (mirror the sampled-token broadcast): no
++        # drafts are consumed, and the other ranks skip the matching receive.
++        if self._is_all_reqs_chunked_prefill():
++            return
++        num_reqs = self.input_batch.num_reqs
++        width = self.num_spec_tokens
++        # Fixed [num_reqs, num_spec] shape the receivers allocate. Pad missing
++        # slots with 0 (a valid token id) rather than -1, so a shape mismatch
++        # can never trip the embedding bounds check on rank 0.
++        out = torch.zeros((num_reqs, width), dtype=torch.int32, device=self.device)
++        draft = self._draft_token_ids
++        if isinstance(draft, torch.Tensor) and draft.dim() == 2:
++            d = draft.to(torch.int32)
++            r = min(d.shape[0], num_reqs)
++            c = min(d.shape[1], width)
++            out[:r, :c] = d[:r, :c]
++        torch.distributed.broadcast(out, src=pp.rank, group=pp.device_group)
++
++    def _pp_receive_draft_token_ids(self) -> None:
++        """Receive the draft token ids broadcast from the last PP stage and
++        stash them in ``self._draft_token_ids`` so the next step's
++        ``_prepare_input_ids`` scatters them into rank 0's (the embedding
++        rank's) input at the spec positions. Paired with
++        ``_pp_broadcast_draft_token_ids``.
++        """
++        pp = get_pp_group()
++        assert not pp.is_last_rank
++        if self._is_all_reqs_chunked_prefill():
++            return
++        num_reqs = self.input_batch.num_reqs
++        width = self.num_spec_tokens
++        recv = torch.empty((num_reqs, width), dtype=torch.int32, device=self.device)
++        torch.distributed.broadcast(recv, src=pp.last_rank, group=pp.device_group)
++        self._draft_token_ids = recv
++
++    def _pp_share_draft_embed_tokens(self) -> None:
++        """Copy the target model's input embedding from the first PP rank into
++        the MTP drafter on the last PP rank (one-time, at load).
++
++        vLLM's `_maybe_share_embeddings` only shares the target embedding with
++        the draft when `pp_world_size == 1`. Under PP the target's
++        `embed_tokens` lives on the first rank while the drafter lives on the
++        last rank, so the share is skipped -- and DeepSeek-V4 checkpoints ship
++        no `mtp.*` embedding weight, so the drafter's `embed_tokens` is left
++        zero/uninitialized. The draft then embeds every token as garbage,
++        ignores the actual previous token and accepts ~0% of its drafts.
++        Broadcasting the embedding restores single-GPU acceptance.
++        """
++        pp = get_pp_group()
++        if pp.world_size <= 1:
++            return
++        # Locate the target embedding (only materialized on the first rank).
++        src_emb = None
++        if pp.is_first_rank:
++            inner = getattr(self.model, "model", None)
++            emb = getattr(inner, "embed_tokens", None)
++            src_emb = getattr(emb, "weight", None)
++        # Broadcast [rows, cols] first so every rank allocates a matching
++        # buffer.
++        shape_t = torch.zeros(2, dtype=torch.int64, device=self.device)
++        if src_emb is not None:
++            shape_t[0], shape_t[1] = src_emb.shape[0], src_emb.shape[1]
++        torch.distributed.broadcast(shape_t, src=pp.first_rank, group=pp.device_group)
++        rows, cols = int(shape_t[0].item()), int(shape_t[1].item())
++        if rows == 0 or cols == 0:
++            logger.warning(
++                "MTP+PP embed share: target embed_tokens not found; skipping "
++                "(draft acceptance will be degraded)."
++            )
++            return
++        dtype = self.model_config.dtype
++        if src_emb is not None:
++            buf = src_emb.detach().to(device=self.device, dtype=dtype).contiguous()
++        else:
++            buf = torch.empty((rows, cols), dtype=dtype, device=self.device)
++        torch.distributed.broadcast(buf, src=pp.first_rank, group=pp.device_group)
++        if pp.is_last_rank and hasattr(self, "drafter"):
++            draft_model = getattr(self.drafter, "model", None)
++            inner = getattr(draft_model, "model", None)
++            dst = getattr(inner, "embed_tokens", None)
++            dst_w = getattr(dst, "weight", None)
++            if dst_w is None:
++                logger.warning(
++                    "MTP+PP embed share: drafter embed_tokens missing; skipping."
++                )
++                return
++            if dst_w.shape != buf.shape:
++                logger.warning(
++                    "MTP+PP embed share: shape mismatch draft=%s target=%s; skip.",
++                    list(dst_w.shape),
++                    list(buf.shape),
++                )
++                return
++            dst_w.data.copy_(buf)
++            logger.info(
++                "MTP+PP: copied target embed_tokens -> drafter %s (abs=%.2f)",
++                list(buf.shape),
++                float(buf.float().abs().sum()),
++            )
++
+     def take_draft_token_ids(self) -> DraftTokenIds | None:
+         if not self.num_spec_tokens or not self._draft_token_req_ids:
+             return None
+@@ -5209,6 +5644,22 @@ class GPUModelRunner(
+                         )
+                         eplb_models += 1
+ 
++                # MTP + PP: the drafter's input embedding cannot be shared
++                # with the target (target embed_tokens is on the FIRST PP
++                # rank, the drafter on the LAST), and vLLM only shares
++                # embeddings when pp_world_size == 1 -> the drafter's
++                # embed_tokens stays zero/uninitialized (DeepSeek-V4
++                # checkpoints carry no mtp.* embedding), the draft embeds
++                # every token as garbage and accepts ~0% of its drafts.
++                # Broadcast the target embedding (first rank) into the drafter
++                # (last rank). Collective: every rank must reach this
++                # (config-gated).
++                if (
++                    self.speculative_config is not None
++                    and get_pp_group().world_size > 1
++                ):
++                    self._pp_share_draft_embed_tokens()
++
+                 self._setup_eagle3_aux_hidden_state_outputs()
+ 
+                 # Resolve the MoE model, unwrapping VLM wrappers if needed.
+@@ -5969,7 +6420,8 @@ class GPUModelRunner(
+             else:
+                 hidden_states = outputs
+ 
+-            if self.speculative_config and (
++            # The drafter lives on the last PP rank only.
++            if self.speculative_config and get_pp_group().is_last_rank and (
+                 self.speculative_config.use_eagle()
+                 or self.speculative_config.uses_draft_model()
+                 or self.speculative_config.uses_extract_hidden_states()
+@@ -6875,8 +7327,9 @@ class GPUModelRunner(
+         # because some of them change the threshold at init time.
+         self.calculate_reorder_batch_threshold()
+ 
+-        # Initialize drafter attention backend
+-        if self.speculative_config and (
++        # Initialize drafter attention backend (drafter lives on the last PP
++        # rank only).
++        if self.speculative_config and get_pp_group().is_last_rank and (
+             self.speculative_config.use_eagle()
+             or self.speculative_config.uses_draft_model()
+         ):
+@@ -6929,7 +7382,8 @@ class GPUModelRunner(
+         )
+ 
+         # Initialize drafter's cudagraph dispatcher if using spec decode.
+-        if self.speculative_config and (
++        # The drafter lives on the last PP rank only.
++        if self.speculative_config and get_pp_group().is_last_rank and (
+             self.speculative_config.use_eagle()
+             or self.speculative_config.uses_extract_hidden_states()
+         ):
 diff --git a/vllm/v1/worker/gpu_ubatch_wrapper.py b/vllm/v1/worker/gpu_ubatch_wrapper.py
 index 657fc8267..dee74ffb4 100644
 --- a/vllm/v1/worker/gpu_ubatch_wrapper.py
@@ -3974,7 +4610,7 @@ index 657fc8267..dee74ffb4 100644
                  ubatch_metadata[0].context.cpu_wait_event.set()
                  for thread in ubatch_threads:
 diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
-index 5e266a313..13dd68831 100644
+index 5e266a313..761593630 100644
 --- a/vllm/v1/worker/gpu_worker.py
 +++ b/vllm/v1/worker/gpu_worker.py
 @@ -616,6 +616,19 @@ class Worker(WorkerBase):
@@ -4006,7 +4642,29 @@ index 5e266a313..13dd68831 100644
                  return output
  
          assert isinstance(output, IntermediateTensors)
-@@ -921,8 +936,49 @@ class Worker(WorkerBase):
+@@ -914,15 +929,69 @@ class Worker(WorkerBase):
+             and not get_pp_group().is_last_rank
+         )
+ 
+-        # launch non-blocking send of intermediate tensors
++        # launch non-blocking send of intermediate tensors.
++        # Under FULL cudagraphs the model output is a VIEW into the cudagraph
++        # memory pool, which the next graph replay (or any other captured
++        # graph) overwrites. The async isend below only guards buffer reuse
++        # via tensor.record_stream(), which is a NO-OP on graph-pool memory ->
++        # the next step can clobber the bytes while the send is still in
++        # flight, producing intermittent cross-stage hidden-state corruption
++        # that compounds over decode steps. Clone into fresh caching-allocator
++        # memory first: the clone is ordered after the graph replay on the
++        # current stream, and record_stream() then correctly defers its reuse
++        # until the send completes.
++        send_tensors = {
++            k: (v.clone() if v.is_cuda else v) for k, v in output.tensors.items()
++        }
+         self._pp_send_work = get_pp_group().isend_tensor_dict(
+-            output.tensors,
++            send_tensors,
+             all_gather_group=get_tp_group(),
              all_gather_tensors=all_gather_tensors,
          )
  
