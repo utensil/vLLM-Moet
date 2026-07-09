@@ -1170,10 +1170,10 @@ index 32a2d8689..3e83d5a87 100644
              mn=r,
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
 new file mode 100644
-index 000000000..b85e95f78
+index 000000000..26ed3b130
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
-@@ -0,0 +1,937 @@
+@@ -0,0 +1,1048 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Routed experts on 2-bit tensor-sym planes (cubit moe_w2) for the
@@ -1401,6 +1401,31 @@ index 000000000..b85e95f78
 +        f"(dir {_DIR}; set VLLM_MOE_W2_CUBIT_DIR)")
 +
 +
++def _fp4_tier_for_build(E: int, dev, n13k13: int, n2k2: int):
++    """FP4 delta tier sized for this model's PER-RANK shapes (n13k13 =
++    N13*K13, n2k2 = N2*K2 elements). Over the base cache the FP4 slots must
++    carry their OWN block-32 scale sections ([fp4_13|sc13|fp4_2|sc2]) — the
++    base planes, and with them the GPU-resident scale planes the standalone
++    delta shares, are host-resident there."""
++    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
++    sc13, sc2 = ((n13k13 // 32, n2k2 // 32)
++                 if moe_w2_delta.base_enabled() else (0, 0))
++    return moe_w2_delta.get_tier(n_experts=E, dev=dev,
++                                 w13_bytes=n13k13 // 2 + sc13,
++                                 w2_bytes=n2k2 // 2 + sc2)
++
++
++def _stage_fp4_host(tier, layer_key: int, fp13, sc13, fp2, sc2) -> None:
++    """Stage a layer's FP4 planes into the tier's pinned host store; over the
++    base cache the scale planes ride along inside the slot sections (copied
++    section-by-section — no GPU-side cat temporaries)."""
++    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
++    if moe_w2_delta.base_enabled():
++        tier.add_layer_host_sections(layer_key, (fp13, sc13), (fp2, sc2))
++    else:
++        tier.add_layer_host_planes(layer_key, fp13, fp2)
++
++
 +def build_layer_planes(layer, layer_key: int) -> None:
 +    """Quantize one FusedMoE layer's experts to 2-bit planes (GPU, chunked).
 +
@@ -1430,9 +1455,7 @@ index 000000000..b85e95f78
 +    # Pass the PER-RANK FP4 plane sizes (N*K//2 bytes/expert) so the delta tier's
 +    # slots, host store, and pool indexing match the (TP-sharded) planes. On TP1
 +    # these equal the module constants -> the single-GPU path is unchanged.
-+    tier = moe_w2_delta.get_tier(n_experts=E, dev=dev,
-+                                 w13_bytes=N13 * K13 // 2,
-+                                 w2_bytes=N2 * K2 // 2)
++    tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2)
 +    fp13 = fp2 = None
 +    if tier is not None:
 +        fp13 = torch.empty(E, N13 * K13 // 2, dtype=torch.uint8, device=dev)
@@ -1459,7 +1482,7 @@ index 000000000..b85e95f78
 +                fp2[e0 + i] = pack_fp4_fragment_major(nib)
 +
 +    if tier is not None:
-+        tier.add_layer_host_planes(layer_key, fp13, fp2)
++        _stage_fp4_host(tier, layer_key, fp13, sc13, fp2, sc2)
 +        del fp13, fp2
 +        # (the background manager is started by get_tier when the tier is
 +        # created; the old "start on layer NUM_LAYERS-1" trigger never fired
@@ -1503,9 +1526,7 @@ index 000000000..b85e95f78
 +    planes2 = torch.empty(E, N2 * K2 // 4, dtype=torch.uint8, device=dev)
 +    sc2 = torch.empty(E, N2 * K2 // 32, dtype=torch.uint8, device=dev)
 +
-+    tier = moe_w2_delta.get_tier(n_experts=E, dev=dev,
-+                                 w13_bytes=N13 * K13 // 2,
-+                                 w2_bytes=N2 * K2 // 2)
++    tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2)
 +    fp13 = fp2 = None
 +    if tier is not None:
 +        fp13 = torch.empty(E, N13 * K13 // 2, dtype=torch.uint8, device=dev)
@@ -1536,7 +1557,7 @@ index 000000000..b85e95f78
 +                fp2[e0 + i] = pack_fp4_fragment_major(nib)
 +
 +    if tier is not None:
-+        tier.add_layer_host_planes(layer_key, fp13, fp2)
++        _stage_fp4_host(tier, layer_key, fp13, sc13, fp2, sc2)
 +        del fp13, fp2
 +
 +    _finish_layer(layer, layer_key, dev, planes13, sc13, planes2, sc2,
@@ -1583,9 +1604,7 @@ index 000000000..b85e95f78
 +    planes2 = torch.empty(E, N2 * K2 // 4, dtype=torch.uint8, device=dev)
 +    sc2 = torch.empty(E, N2 * K2 // 32, dtype=torch.uint8, device=dev)
 +
-+    tier = moe_w2_delta.get_tier(n_experts=E, dev=dev,
-+                                 w13_bytes=N13 * K13 // 2,
-+                                 w2_bytes=N2 * K2 // 2)
++    tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2)
 +    fp13 = fp2 = None
 +    if tier is not None:
 +        fp13 = torch.empty(E, N13 * K13 // 2, dtype=torch.uint8, device=dev)
@@ -1622,7 +1641,7 @@ index 000000000..b85e95f78
 +                fp2[e0 + i] = pack_fp4_fragment_major(nib)
 +
 +    if tier is not None:
-+        tier.add_layer_host_planes(layer_key, fp13, fp2)
++        _stage_fp4_host(tier, layer_key, fp13, sc13, fp2, sc2)
 +        del fp13, fp2
 +
 +    _finish_layer(layer, layer_key, dev, planes13, sc13, planes2, sc2,
@@ -1653,6 +1672,11 @@ index 000000000..b85e95f78
 +            N13=N13, K13=K13, N2=N2, K2=K2, E=E, base=True,
 +            off_s13=c13len, off_c2=c13len + s13len,
 +            off_s2=c13len + s13len + c2len,
++            # FP4 need-pool slot sections ([fp4_13|sc13|fp4_2|sc2]; fp4 codes
++            # are 2x the 2-bit codes, scale sections identical) — read by the
++            # base+delta desc kernel when the FP4 tier coexists.
++            off4_s13=2 * c13len, off4_c2=2 * c13len + s13len,
++            off4_s2=2 * c13len + s13len + 2 * c2len,
 +        )
 +        del planes13, sc13, planes2, sc2
 +        stub = torch.empty(0, dtype=torch.uint8, device=dev)
@@ -1881,6 +1905,65 @@ index 000000000..b85e95f78
 +        tl.store(d + 5, m, mask=mask)
 +
 +
++@triton.jit
++def _desc_build_kernel_base_delta(
++    eids_ptr, npost_ptr, bslot_ptr, fslot_ptr, miss_ptr, d_ptr,
++    a1b, as1b, c13b, a2b, as2b, c2b,
++    bpoolb, bslot_bytes, off_s13, off_c2, off_s2,
++    fpoolb, fslot_bytes, off4_s13, off4_c2, off4_s2,
++    a1_rb, as1_rb, c13_rb, a2_rb, as2_rb, c2_rb,
++    n_experts, pairs, cap6, mblock,
++    BLOCK: tl.constexpr,
++):
++    """Base cache + FP4 need-pool coexistence variant: TWO slot tables with
++    priority FP4 > 2-bit base slot > miss. FP4-resident pairs go to the w4
++    tier (d[2]/d[3]) reading [fp4_13|sc13|fp4_2|sc2] sections from the FP4
++    pool (the slots carry their own scales — no GPU-resident scale planes
++    exist with a host-resident base); the rest go to the w2 tier (d[0]/d[1])
++    from the base pool. A live pair resident in NEITHER pool gets m=0 in both
++    tiers (contributes zero) and bumps `miss_ptr` — same replay contract as
++    the plain base-cache kernel. All four desc tables are written."""
++    p = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
++    mask = p < pairs
++    e = tl.load(eids_ptr + p, mask=mask, other=0).to(tl.int64)
++    e = tl.minimum(tl.maximum(e, 0), n_experts - 1)
++    bslot = tl.load(bslot_ptr + e, mask=mask, other=-1).to(tl.int64)
++    fslot = tl.load(fslot_ptr + e, mask=mask, other=-1).to(tl.int64)
++    npost = tl.load(npost_ptr).to(tl.int64)
++    live = p < npost // mblock
++    is4 = fslot >= 0
++    bhit = bslot >= 0
++    m2 = tl.where(live & bhit & ~is4, mblock, 0).to(tl.int64)
++    m4 = tl.where(live & is4, mblock, 0).to(tl.int64)
++    n_miss = tl.sum(tl.where(mask & live & ~bhit & ~is4, 1, 0))
++    tl.atomic_add(miss_ptr, n_miss)
++    base = p.to(tl.int64) * mblock
++    bs = bpoolb + tl.maximum(bslot, 0) * bslot_bytes
++    fs = fpoolb + tl.maximum(fslot, 0) * fslot_bytes
++    a1 = a1b + base * a1_rb
++    as1 = as1b + base * as1_rb
++    c13 = c13b + base * c13_rb
++    a2 = a2b + base * a2_rb
++    as2 = as2b + base * as2_rb
++    c2 = c2b + base * c2_rb
++    for gi in tl.static_range(4):
++        d = d_ptr + gi * cap6 + p * 6
++        if gi == 0:
++            b, s, a, as_, c, m = bs, bs + off_s13, a1, as1, c13, m2
++        elif gi == 1:
++            b, s, a, as_, c, m = bs + off_c2, bs + off_s2, a2, as2, c2, m2
++        elif gi == 2:
++            b, s, a, as_, c, m = fs, fs + off4_s13, a1, as1, c13, m4
++        else:
++            b, s, a, as_, c, m = fs + off4_c2, fs + off4_s2, a2, as2, c2, m4
++        tl.store(d + 0, a, mask=mask)
++        tl.store(d + 1, as_, mask=mask)
++        tl.store(d + 2, b, mask=mask)
++        tl.store(d + 3, s, mask=mask)
++        tl.store(d + 4, c, mask=mask)
++        tl.store(d + 5, m, mask=mask)
++
++
 +def _launch(tier: str, K: int, desc: torch.Tensor, n_rows: int, pairs: int,
 +            stream):
 +    fn = _fns[(tier, K)]
@@ -1973,36 +2056,64 @@ index 000000000..b85e95f78
 +        # pair with a non-resident expert contributes zero and bumps the miss
 +        # counter (runner fetches + replays). Prefill fetches its whole layer
 +        # working set up-front (outside capture) — decode must stay
-+        # capturable, so misses are handled post-hoc.
++        # capturable, so misses are handled post-hoc. The FP4 need-pool
++        # (delta tier over the base cache, gate-filled) coexists on the
++        # decode path: FP4-resident pairs divert to the w4 tier.
 +        btier = moe_w2_delta._BASE_TIER
++        tier = moe_w2_delta._TIER        # FP4 need-pool (None unless opted in)
 +        if torch.cuda.is_current_stream_capturing():
 +            btier.notify_capture()
++            if tier is not None:
++                tier.notify_capture()
 +        elif prefill:
 +            btier.ensure_resident(layer_key, topk_ids.view(-1))
 +        moe_w2_delta.mark_seen(btier.seen[layer_key], topk_ids.view(-1).long())
++        if tier is not None:
++            # the gate's force_promote reads the FP4 tier's own seen scatter
++            moe_w2_delta.mark_seen(tier.seen[layer_key],
++                                   topk_ids.view(-1).long())
 +        if layer_key == 0:
 +            # per-step counter reset, in-graph (layer 0 runs first each step)
 +            btier.miss_count.zero_()
 +        slot_row = btier.slot_table[layer_key]
-+        _desc_build_kernel_basecache[(triton.cdiv(pairs, 256),)](
-+            expert_blocks, num_post, slot_row,
-+            btier.miss_count, d,
-+            a1_base.data_ptr(), ws["as1"].data_ptr(), ws["c13"].data_ptr(),
-+            a2_base.data_ptr(), ws["as2"].data_ptr(), ws["c2"].data_ptr(),
-+            btier.pool.data_ptr(), btier.slot_bytes,
-+            st["off_s13"], st["off_c2"], st["off_s2"],
-+            st["K13"], (st["K13"] // 128) * 4, 4 * st["K2"], st["K2"],
-+            (st["K2"] // 128) * 4, 2 * st["K13"],
-+            st["E"], pairs, cap * 6, mblock, BLOCK=256)
++        use_fp4 = tier is not None and not prefill
++        if use_fp4:
++            fslot_row = tier.slot_table[layer_key]
++            _desc_build_kernel_base_delta[(triton.cdiv(pairs, 256),)](
++                expert_blocks, num_post, slot_row, fslot_row,
++                btier.miss_count, d,
++                a1_base.data_ptr(), ws["as1"].data_ptr(), ws["c13"].data_ptr(),
++                a2_base.data_ptr(), ws["as2"].data_ptr(), ws["c2"].data_ptr(),
++                btier.pool.data_ptr(), btier.slot_bytes,
++                st["off_s13"], st["off_c2"], st["off_s2"],
++                tier.pool.data_ptr(), tier.slot_bytes,
++                st["off4_s13"], st["off4_c2"], st["off4_s2"],
++                st["K13"], (st["K13"] // 128) * 4, 4 * st["K2"], st["K2"],
++                (st["K2"] // 128) * 4, 2 * st["K13"],
++                st["E"], pairs, cap * 6, mblock, BLOCK=256)
++        else:
++            _desc_build_kernel_basecache[(triton.cdiv(pairs, 256),)](
++                expert_blocks, num_post, slot_row,
++                btier.miss_count, d,
++                a1_base.data_ptr(), ws["as1"].data_ptr(), ws["c13"].data_ptr(),
++                a2_base.data_ptr(), ws["as2"].data_ptr(), ws["c2"].data_ptr(),
++                btier.pool.data_ptr(), btier.slot_bytes,
++                st["off_s13"], st["off_c2"], st["off_s2"],
++                st["K13"], (st["K13"] // 128) * 4, 4 * st["K2"], st["K2"],
++                (st["K2"] // 128) * 4, 2 * st["K13"],
++                st["E"], pairs, cap * 6, mblock, BLOCK=256)
 +        # Miss pairs get scatter weight 0: the GEMMs early-EXIT on m=0 and
 +        # never write their c13/c2 rows, but those workspace rows hold STALE
 +        # values from a previous forward — zeroing the WEIGHT (not the rows)
 +        # makes the miss contribution an exact 0 for free. Graph-safe (pure
-+        # tensor ops on captured buffers).
++        # tensor ops on captured buffers). FP4-resident pairs are NOT misses.
 +        e_pair = expert_blocks.to(torch.long).clamp_(0, st["E"] - 1)
 +        resident = (slot_row[e_pair] >= 0)
++        if use_fp4:
++            resident |= (fslot_row[e_pair] >= 0)
 +        miss_rows = resident.repeat_interleave(mblock)[:slots]
-+        tier = None                      # no FP4 delta with the base cache
++        if not use_fp4:
++            tier = None      # downstream w4 launches key off `tier`
 +    else:
 +        tier = moe_w2_delta._TIER       # peek only; created by the plane builder
 +        if tier is not None and not prefill:
@@ -2113,10 +2224,10 @@ index 000000000..b85e95f78
 +    return enabled() and _ensure_ready()
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
 new file mode 100644
-index 000000000..7e1790ce8
+index 000000000..5261f931d
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
-@@ -0,0 +1,850 @@
+@@ -0,0 +1,907 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""FP4 delta tier for the 1-GPU 2-bit MoE path (quality restoration).
@@ -2231,9 +2342,25 @@ index 000000000..7e1790ce8
 +class DeltaTier:
 +    def __init__(self, n_layers: int, n_experts: int, dev,
 +                 w13_bytes: int = W13_BYTES, w2_bytes: int = W2_BYTES,
-+                 pool_gb: float | None = None):
++                 pool_gb: float | None = None, policy: str | None = None,
++                 tag: str = "delta", host_pinned: bool = True):
 +        self.n_layers = n_layers
 +        self.E = n_experts
++        # Per-instance policy/tag: with the base cache and the FP4 tier
++        # coexisting, the base tier wants freq/lru (hot-set convergence)
++        # while the FP4 tier wants "need" (gate-filled only) — a shared
++        # module-level policy cannot express that. `tag` disambiguates the
++        # two tiers' log lines.
++        self._policy = policy if policy is not None else _POLICY
++        self._tag = tag
++        # Pinned host store is right for tiers that promote continuously (the
++        # base cache's misses, the standalone delta's lazy manager). The FP4
++        # need-pool OVER the base promotes only on gate fires — pageable
++        # memory there saves ~360 GiB of pinned RAM on GLM TP2/TP4 (pinning
++        # that much alongside the base store + load staging exhausts a 1 TB
++        # host: measured OOM at boot), at the cost of a bounce-buffer copy on
++        # the rare promote.
++        self._host_pinned = host_pinned
 +        if isinstance(dev, torch.device) and dev.index is None:
 +            dev = torch.device("cuda", torch.cuda.current_device())
 +        self.dev = dev
@@ -2374,10 +2501,22 @@ index 000000000..7e1790ce8
 +        Called from the plane builder while the FP4 planes are transiently
 +        on GPU; w13/w2 are [E, bytes] u8.
 +        """
++        self.add_layer_host_sections(layer_key,
++                                     (w13_plane_gpu,), (w2_plane_gpu,))
++
++    def add_layer_host_sections(self, layer_key: int, parts13, parts2):
++        """Stage a layer whose slot sections arrive as SEPARATE GPU tensors
++        (e.g. [fp4_13|sc13] / [fp4_2|sc2] for the over-base FP4 tier): copy
++        each part D2H into its slice of the host row — a GPU-side cat of
++        multi-GiB planes is exactly the transient that OOMs a 32 GB card
++        during load."""
 +        host = torch.empty(self.E, self.slot_bytes, dtype=torch.uint8,
-+                           pin_memory=True)
-+        host[:, :self.w13_bytes].copy_(w13_plane_gpu, non_blocking=False)
-+        host[:, self.w13_bytes:].copy_(w2_plane_gpu, non_blocking=False)
++                           pin_memory=self._host_pinned)
++        off = 0
++        for t in (*parts13, *parts2):
++            host[:, off:off + t.shape[1]].copy_(t, non_blocking=False)
++            off += t.shape[1]
++        assert off == self.slot_bytes, (off, self.slot_bytes)
 +        self._host[layer_key] = host
 +
 +    def start(self):
@@ -2454,8 +2593,8 @@ index 000000000..7e1790ce8
 +            # gets pulled to the slower FP4 path). freq/lru: promote the hottest
 +            # candidates first so the limited pool tracks genuinely hot experts
 +            # across ALL layers (vs the layer-sorted order that starved past layer 0).
-+            if _POLICY != "need":
-+                if _POLICY == "freq" and len(cand) > 1:
++            if self._policy != "need":
++                if self._policy == "freq" and len(cand) > 1:
 +                    ca = torch.tensor(cand)
 +                    order = torch.argsort(self._freq[ca[:, 0], ca[:, 1]],
 +                                          descending=True)
@@ -2505,9 +2644,9 @@ index 000000000..7e1790ce8
 +        ei = torch.tensor([o[1] for o in self._owner], dtype=torch.long)
 +        tk = torch.tensor([o[2] for o in self._owner], dtype=torch.float64)
 +        lic, eic = li.clamp(min=0), ei.clamp(min=0)
-+        if _POLICY == "need":
++        if self._policy == "need":
 +            key = self._need[lic, eic].double()
-+        elif _POLICY == "freq":
++        elif self._policy == "freq":
 +            key = self._freq[lic, eic].double()
 +        else:
 +            key = tk.clone()
@@ -2526,8 +2665,8 @@ index 000000000..7e1790ce8
 +                self._win_evicted += 1
 +                if _TRACE >= 2:
 +                    logger.info(
-+                        "[delta] evict   L%-2d E%-3d  slot %-4d (cold %d ticks)",
-+                        vli, vei, s, self._tick - vt)
++                        "[%s] evict   L%-2d E%-3d  slot %-4d (cold %d ticks)",
++                        self._tag, vli, vei, s, self._tick - vt)
 +                out.append(s)
 +        return out
 +
@@ -2548,8 +2687,8 @@ index 000000000..7e1790ce8
 +        self._n_promoted += 1
 +        self._win_promoted += 1
 +        if _TRACE >= 2:
-+            logger.info("[delta] promote L%-2d E%-3d  slot %-4d (tick %d)",
-+                        li, ei, slot, self._tick)
++            logger.info("[%s] promote L%-2d E%-3d  slot %-4d (tick %d)",
++                        self._tag, li, ei, slot, self._tick)
 +
 +    # ---- confidence-gated re-forward (directive 2 / Step B) --------------
 +
@@ -2623,7 +2762,7 @@ index 000000000..7e1790ce8
 +            # policy (repeat offenders first); hottest-first otherwise.
 +            if len(cand) > 1:
 +                ca = torch.tensor(cand)
-+                rank = self._need if _POLICY == "need" else self._freq
++                rank = self._need if self._policy == "need" else self._freq
 +                order = torch.argsort(rank[ca[:, 0], ca[:, 1]], descending=True)
 +                cand = [cand[i] for i in order.tolist()]
 +            if max_promote is not None:
@@ -2655,7 +2794,8 @@ index 000000000..7e1790ce8
 +            self._n_promoted += len(plan)
 +            self._win_promoted += len(plan)
 +        if _TRACE >= 2:
-+            logger.info("[delta] force-promote %d experts (gate)", len(plan))
++            logger.info("[%s] force-promote %d experts (gate)",
++                        self._tag, len(plan))
 +        return len(plan)
 +
 +    def ensure_resident(self, layer_key: int, ids: torch.Tensor) -> int:
@@ -2772,15 +2912,15 @@ index 000000000..7e1790ce8
 +        hr = 100.0 * self._win_hits / max(self._win_active, 1.0)
 +        hrd = 100.0 * self._win_hits_d / max(self._win_active_d, 1)
 +        logger.info(
-+            "[delta] tick %d: FP4 %d/%d slots, covering %d/%d experts (%.1f%%); "
++            "[%s] tick %d: %d/%d slots, covering %d/%d experts (%.1f%%); "
 +            "hit-rate %.1f%% tokens / %.1f%% experts; window +%d/-%d, cumulative +%d/-%d",
-+            self._tick, cached, self.n_slots, cached, total,
++            self._tag, self._tick, cached, self.n_slots, cached, total,
 +            100.0 * cached / max(total, 1), hr, hrd, self._win_promoted,
 +            self._win_evicted, self._n_promoted, self._n_evicted)
 +        per_layer = cov.sum(dim=1).tolist()
 +        hist = " ".join(f"L{li}:{int(c)}" for li, c in enumerate(per_layer) if c)
 +        if hist:
-+            logger.info("[delta] FP4 experts per layer: %s", hist)
++            logger.info("[%s] experts per layer: %s", self._tag, hist)
 +        # CONCENTRATION study: compare how top-heavy low-confidence routing (_need,
 +        # from the gate via mark_need_only) is vs overall routing (_freq). If the
 +        # top few % of experts hold MOST of the _need mass while _freq is spread,
@@ -2864,7 +3004,15 @@ index 000000000..7e1790ce8
 +# UE8M0 scales, four sections per expert) and a miss cannot be served by any
 +# resident fallback — the desc kernel zeroes the pair and bumps a miss
 +# counter, and the runner re-runs the step after a synchronous fetch.
-+# Mutually exclusive with the FP4 delta tier (they'd fight over `seen`).
++#
++# The FP4 delta tier CAN coexist with the base cache (explicit opt-in:
++# VLLM_MOE_W2_DELTA_GB=<GiB> set in the environment; "auto" unsupported
++# here). It then acts as the quality-recovery tier for host-resident bases:
++# a small gate-filled ("need" policy) FP4 pool whose slots carry their OWN
++# block-32 scales ([fp4_13|sc13|fp4_2|sc2] — with the base host-resident
++# there are no GPU-resident scale planes to share). The desc kernel reads
++# BOTH slot tables with priority FP4 > 2-bit slot > miss; each tier has its
++# own `seen` tensor (the forward marks both), own manager, own policy.
 +_BASE_GB = float(os.getenv("VLLM_MOE_W2_BASE_CACHE_GB", "0"))
 +_BASE_TIER: DeltaTier | None = None
 +
@@ -2901,9 +3049,20 @@ index 000000000..7e1790ce8
 +    return _base_tol_dyn
 +
 +
++# Was VLLM_MOE_W2_DELTA_GB set explicitly (vs the "2.0" default)? Coexistence
++# with the base cache must be opt-in: the historical base-cache configs never
++# set DELTA_GB and must not silently grow an FP4 pool out of the default.
++_GB_EXPLICIT = "VLLM_MOE_W2_DELTA_GB" in os.environ
++
++
 +def enabled() -> bool:
-+    return (not base_enabled() and (_GB > 0 or _AUTO)
-+            and os.getenv("VLLM_MOE_W2_DELTA", "1") == "1")
++    if os.getenv("VLLM_MOE_W2_DELTA", "1") != "1":
++        return False
++    if base_enabled():
++        # FP4 need-pool OVER the base cache: explicit GiB only (auto's
++        # after-KV sizing belongs to the base pool math, not this tier).
++        return _GB_EXPLICIT and _GB > 0
++    return _GB > 0 or _AUTO
 +
 +
 +def base_enabled() -> bool:
@@ -2921,7 +3080,7 @@ index 000000000..7e1790ce8
 +    if _BASE_TIER is None:
 +        _BASE_TIER = DeltaTier(n_layers, n_experts, dev,
 +                               w13_bytes=w13_bytes, w2_bytes=w2_bytes,
-+                               pool_gb=_BASE_GB)
++                               pool_gb=_BASE_GB, tag="base")
 +        # decode misses counted by the desc kernel (atomic, in-graph); zeroed
 +        # in-graph at the first layer of every forward, read by the runner
 +        # after logits to decide the fetch+replay.
@@ -2954,10 +3113,19 @@ index 000000000..7e1790ce8
 +            n_layers = moe_w2_cubit._layer_cutoff() + 1
 +        # The plane builder passes the per-rank FP4 plane sizes (smaller under
 +        # TP); fall back to the TP1 module constants when unspecified.
++        # Over the base cache the tier defaults to the "need" policy: the pool
++        # is a QUALITY tier filled only by the confidence gate — a freq-filled
++        # pool would duplicate the base tier's hot set at 2x the read bytes.
++        # An explicit VLLM_MOE_W2_DELTA_POLICY still wins.
++        policy = None
++        if base_enabled():
++            policy = os.getenv("VLLM_MOE_W2_DELTA_POLICY", "need")
 +        _TIER = DeltaTier(
 +            n_layers, n_experts, dev or torch.device("cuda"),
 +            w13_bytes=W13_BYTES if w13_bytes is None else w13_bytes,
-+            w2_bytes=W2_BYTES if w2_bytes is None else w2_bytes)
++            w2_bytes=W2_BYTES if w2_bytes is None else w2_bytes,
++            policy=policy, tag="fp4" if base_enabled() else "delta",
++            host_pinned=not base_enabled())
 +        # Start the background manager as soon as the tier exists. It idles until
 +        # experts are actually routed (seen empty -> early return) and only
 +        # promotes layers whose host planes are already staged, so an early start

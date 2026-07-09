@@ -99,9 +99,13 @@ The same knob puts **GLM‑5.2 (753B) on two 96 GB cards**: TP2 with a 42–48 G
 (~50% of experts; the 2‑bit base alone is ~190 GiB, matching the *entire* 2‑GPU VRAM
 budget) serves coherently at 32K context — **~33 tok/s** with MTP k=2 (acceptance 3.0;
 ~19 without), hit‑rate 91% of routings at half coverage, needle retrieval **4/4 PASS** at
-3.4K/8K/16K/27K prompt tokens. Numeric‑heavy quality wants the FP4 tier back on top (a
-three‑tier host→2‑bit→FP4 hierarchy — in progress); throughput scales with per‑step
-residency, which MTP‑draft prefetch will raise next.
+3.4K/8K/16K/27K prompt tokens. For numeric‑heavy quality the **FP4 tier stacks on top**: a
+small gate‑filled FP4 pool (own scales in‑slot, pageable host store) coexists with the base
+cache — **three tiers: host 2‑bit → GPU 2‑bit cache → GPU FP4** — recovering the bare‑2‑bit
+quality losses (e.g. GLM's "capital of Poland: Krakow" → "Warsaw", garbled Polish → correct)
+at ~zero throughput cost from the gate itself (`VLLM_MOE_W2_BASE_CACHE_GB=… -e
+VLLM_MOE_W2_DELTA_GB=2 -e VLLM_MOE_W2_GATE=1`). Throughput scales with per‑step residency,
+which MTP‑draft prefetch will raise next.
 
 ---
 
