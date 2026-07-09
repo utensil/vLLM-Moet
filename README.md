@@ -1,9 +1,11 @@
 # DeepSeek‑V4‑Flash on Blackwell (SM120)
 
-**Official vLLM v0.24.0 + a 4.3k‑line patch** that (a) makes DeepSeek‑V4‑Flash (159B MoE)
+**Official vLLM v0.24.0 + a 5.6k‑line patch** that (a) makes DeepSeek‑V4‑Flash (159B MoE)
 actually run on consumer/workstation Blackwell — the release is broken‑as‑shipped for DS4 on
 SM120 — and (b) fits it on hardware the FP4 checkpoint can't reach, by compressing the experts
-to **2 bits** with **FP4 recovery**, on hand‑written SM120 SASS kernels.
+to **2 bits** with **FP4 recovery**, on hand‑written SM120 SASS kernels. At the extreme end
+the 2‑bit base itself moves to host RAM and the GPU becomes an **expert cache** — which puts
+the 159B model on **a single RTX 5090**.
 
 ## What you get
 
@@ -15,6 +17,7 @@ Official DeepSeek‑V4‑Flash checkpoint, 2‑bit experts + FP4 delta cache, MT
 | **1× RTX PRO 6000 (96 GB)** | **161 tok/s** | **5 340 tok/s** | **512K** |
 | **2× RTX PRO 6000 (TP2)** | **210 tok/s** | **5 790 tok/s** (pre‑AFRAG) | 512K |
 | **4× RTX 5090 (TP4)** | **214 tok/s** | **6 100 tok/s** | 16K+ |
+| **1× RTX 5090 (32 GB)** | **~32 tok/s** (host‑resident base, see below) | — | 8K |
 
 **Batched serving** (aggregate decode tok/s at N concurrent streams; per‑stream in
 parentheses at N=32):
@@ -69,6 +72,32 @@ sign‑symmetric codebook at load, float64‑exact vs the reference pipeline).
 
 ---
 
+## 159B on one RTX 5090 — the GPU as an expert cache
+
+The 2‑bit planes of DeepSeek‑V4‑Flash total **72.7 GiB** — 2.3× the VRAM of an RTX 5090.
+`VLLM_MOE_W2_BASE_CACHE_GB=N` inverts the residency: the **whole 2‑bit base lives in pinned
+host RAM**, and the GPU holds only the FP8 dense stack, KV, and an N‑GiB **cache of hot
+experts** (same slot‑table machinery as the delta tier, read inside CUDA graphs; background
+prefetch keeps it converged to the routed working set). MoE routing turns out to be
+concentrated enough to make this practical: **19% coverage serves ~96% of token→expert
+routings** once warm (89% on GLM‑5.2 at 20% coverage — measured live, not simulated).
+
+Misses cannot be served from anything resident, so correctness comes from the same replay
+trick the confidence gate uses: the desc kernel zeroes a missing expert's contribution and
+bumps an in‑graph miss counter; the runner then fetches **all** missing routed experts in one
+batched pinned‑H2D transfer (51.6 GiB/s on this box; a 64‑expert fetch is ~3 ms) and replays
+the step's graph once — the replay is **bit‑identical** to a fully resident forward
+(unit‑tested). Prefill prefetches its per‑layer working set up front instead.
+
+Result on **1× RTX 5090 (32 GB)**: 22.9 GiB on GPU (dense FP8 + 14 GiB pool = 19% of
+experts), 72.7 GiB pinned host RAM, CUDA graphs on, coherent greedy output — **~32 tok/s**
+steady decode on a stable working set, 10–21 tok/s while the working set shifts (miss
+replays). Not a speed demon — a **capacity unlock**: the model this card cannot even hold
+now runs on it, and the same knob is the path to GLM‑5.2 (753B) on two 96 GB cards, where
+the pool covers ~58% of experts and misses become rare.
+
+---
+
 ## The base: vLLM v0.24.0 on SM120
 
 Upstream v0.24.0 ships DeepSeek‑V4 + SM120 natively — but the release cannot actually serve
@@ -115,6 +144,11 @@ docker run --rm --gpus '"device=0"' --network host --ipc host --shm-size 64g \
 (+ optional `VLLM_MOE_W2_GATE_TAU`). `VLLM_MOE_W2_DELTA_GB=auto` sizes the FP4 pool from
 the VRAM left after KV allocation (0 at extreme context, ~1.6 GiB at 24K — no manual
 delta-vs-KV bookkeeping; see [docs/v024-port.md](docs/v024-port.md)).
+
+Single‑5090 (host‑resident base): swap the delta knobs for
+`-e VLLM_MOE_W2_BASE_CACHE_GB=14 -e VLLM_MOE_W2_DELTA_GB=0` and use
+`--max-model-len 8192 --gpu-memory-utilization 0.90 --max-num-seqs 2` (needs ~80 GiB free
+host RAM for the pinned base; TP/PP unsupported on this path yet, MTP off).
 
 ## Quality
 
@@ -168,8 +202,8 @@ kernels here can be *written* through stock CUDA on sm_120 — the instructions 
 kernels don't; this toolchain is what makes them possible.
 
 ## Repository layout
-- **`patch/vllm-moet-v0.24.0.patch`** — the delta vs official vLLM `v0.24.0` (22 files,
-  +4.3k lines; applies clean on the tag). Goes with the pins above.
+- **`patch/vllm-moet-v0.24.0.patch`** — the delta vs official vLLM `v0.24.0` (32 files,
+  +5.6k lines; applies clean on the tag). Goes with the pins above.
 - **`Dockerfile.sm120-v024`** — the image: official `vllm/vllm-openai:v0.24.0` + patch + pins +
   cubins.
 - **`kernels/`** — SASS (`sass/`) + prebuilt SM120 cubins (`cubins-sm120/`, incl. the K=6144

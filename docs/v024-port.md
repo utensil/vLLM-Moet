@@ -55,6 +55,21 @@ Environment pins that go with the patch (both required on SM120):
   re‑quantizes to the sign‑symmetric codebook (`nvfp4_to_codes_scales`; the UE8M0 block‑32
   output scales absorb `scale_2`). Golden‑tested EXACT on real checkpoint shards; forward
   op‑validated through the K=6144/K=2048 cubins on real weights.
+- **BASE cache** (`VLLM_MOE_W2_BASE_CACHE_GB=N`, the "159B on one 5090" path): the packed
+  2‑bit base planes (codes + UE8M0 scales, four sections per expert slot) live in pinned host
+  RAM; the GPU pool caches hot experts through the same slot‑table/manager/eviction machinery
+  as the delta tier. Decode misses zero the pair's contribution, bump an in‑graph miss
+  counter, and the runner fetches all missing routed experts synchronously (batched pinned
+  H2D, 51.6 GiB/s measured) and replays the step's graph once — replay bit‑identical to a
+  resident forward (unit‑tested, `internal` test_base_cache). Prefill prefetches per layer
+  via `ensure_resident`. TP OR‑reduces the miss decision; PP unsupported; mutually exclusive
+  with the FP4 delta tier. Measured on 1× RTX 5090: 22.9 GiB GPU / 72.7 GiB pinned host,
+  ~32 tok/s steady (96% pool hit at 19% coverage), 10–21 tok/s under working‑set shift.
+- **Deterministic unpermute**: the MoE output scatter used atomic `index_add_`, so identical
+  runs wobbled (~1.6e‑2 on prefill) and greedy decode was not reproducible (surfaced by the
+  PP determinism investigation; never PP‑specific). Valid `sorted_ids` form a permutation of
+  `token*top_k+j`, so a bijective `index_copy_` + fixed‑order `sum(dim=1)` replaces it —
+  6/6 bit‑identical repeats on prefill and decode, capture‑safe.
 - MTP under **pipeline parallelism** (ported from the fork, inert off‑PP/off‑spec): draft‑token
   broadcast to rank 0 under async scheduling, `output_token_ids` trim on all ranks, and the
   drafter `embed_tokens` share across PP ranks (the NVFP4/DS4 MTP head ships no embedding of
