@@ -161,27 +161,39 @@ and cubins): MTP acceptance 2.73 vs 2.68 FP4 reference, draft accept 86.3% vs 84
 coherent greedy outputs; bare 2‑bit agrees with FP4 on 89% of next‑token picks — the delta
 cache + gate close that gap. Live serving reproduces the acceptance (~2.6 tok/step).
 
-## GLM‑5.2: first live serving (bring‑up in progress)
+## GLM‑5.2 on 4× RTX PRO 6000
 
-**GLM‑5.2 (753B MoE) serves on 4× RTX PRO 6000** from the official
+**GLM‑5.2 (753B MoE) serves on 4× RTX PRO 6000 (TP4)** from the official
 [nvidia/GLM-5.2-NVFP4](https://huggingface.co/nvidia/GLM-5.2-NVFP4) checkpoint (433 GB): the
 loader re‑quantizes modelopt NVFP4 experts (e2m1 × e4m3 block‑16 × per‑tensor scale_2) to the
 same sign‑symmetric 2‑bit planes at load — f64‑exact vs the sweep reference on real shards —
-and serves through the K=6144/K=512 kernel family. Smoke status (TP4, 16K ctx, MTP/delta off):
-coherent EN/code/PL output, **56 tok/s** single‑stream decode with CUDA graphs, ~2.5k tok/s
-prefill. The sign‑symmetric codebook finding reproduces on GLM‑5.2's weights (`internal`
-sweep). MTP, the FP4 delta tier (the NVFP4 checkpoint provides an official FP4 source) and
-full benchmarks are next.
+and serves through the K=6144/K=512 kernel family. The sign‑symmetric codebook finding
+reproduces on GLM‑5.2's weights (`internal` sweep). Measured (single‑stream, greedy,
+CUDA graphs; 2026‑07‑09):
+
+| config (TP4, 128K window) | decode | notes |
+|---|---:|---|
+| 2‑bit base | 56 tok/s | eager: 12 → graphs 4.7× |
+| + **MTP** (`{"method":"mtp","num_speculative_tokens":2}`) | **105 tok/s** | acceptance 2.3–2.8, content‑dependent |
+| + FP4 delta (auto) + confidence gate τ=0.60 | **83–85 tok/s** | the quality tier: FP4 re‑decides low‑confidence steps |
+
+Prefill ~2.5k tok/s (8–13.5K prompts). Long context, validated by needle retrieval:
+**PASS to 126K** on the nvfp4 KV cache and **to 276K** on fp8 (331K window fits at util 0.95);
+GLM's nominal 1M window is KV‑bound on 4 cards. Tool calling (`glm47`) and reasoning (`glm45`)
+parsers work — the served endpoint drives coding agents (opencode) out of the box.
 
 MTP under **pipeline parallelism** also landed: the patch carries draft‑token propagation +
 drafter embedding share across PP ranks — DeepSeek‑V4‑Flash on 4× RTX 5090 **PP4** does
-184 tok/s with MTP vs 93 without (~2×), acceptance up to 2.81.
+184 tok/s with MTP vs 93 without (~2×), acceptance up to 2.81. Greedy decode under PP is
+**bit‑deterministic** (6/6 identical runs with and without MTP) since the bijective‑unpermute
+fix.
 
 **NVFP4 KV cache** (`--kv-cache-dtype nvfp4`) packs the SM120 sparse‑MLA KV to **352 B/token**
-(vs 656 B `fp8_ds_mla`) — on GLM‑5.2 TP4 that is **+38% KV pool** (415K → 571K tokens at 128K
-ctx) at decode parity, needle PASS to 126K. See [docs/v024-port.md](docs/v024-port.md) for this
-and the other v0.24 additions (deterministic MoE unpermute, the host‑resident BASE cache, AFRAG
-prefill).
+(vs 656 B `fp8_ds_mla`) — on GLM‑5.2 TP4 that is **+38% KV pool** (415K → 571K tokens at equal
+settings) at decode parity, or the freed VRAM goes to the FP4 delta pool (the standing config
+runs a 19.6 GiB/GPU pool + 175K‑token KV in 128K windows). See
+[docs/v024-port.md](docs/v024-port.md) for this and the other v0.24 additions (deterministic
+MoE unpermute, the host‑resident BASE cache, AFRAG prefill).
 
 ## The SM120 toolchain we built
 
