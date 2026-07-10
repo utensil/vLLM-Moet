@@ -76,6 +76,14 @@ RUN cd "$(python3 -c 'import vllm, os; print(os.path.dirname(os.path.dirname(vll
     && python3 -c "from vllm.model_executor.layers.quantization.utils import moe_w2_cubit; print('moe_w2 hook OK')" \
     && rm /tmp/vllm-moet.patch
 
+# 3b. streaming plane-build injection (opt-in via VLLM_MOE_W2_STREAM=1). The
+#     stock path host-stages ALL NVFP4 experts before building 2-bit planes
+#     (~380 GiB peak for GLM-5.2, OOMs a RunPod cgroup). Streaming builds each
+#     layer's planes as it loads and frees its NVFP4, bounding peak host RAM.
+#     Default off => byte-identical to stock, so the proven DS4 path is intact.
+COPY tools/inject_streaming.py /tmp/inject_streaming.py
+RUN python3 /tmp/inject_streaming.py && rm /tmp/inject_streaming.py
+
 # 4. SM120 cubins (moe_w2/w4 GEMMs incl. K=6144 for GLM-5.x)
 COPY kernels/cubins-sm120/ /cubit-share/
 ENV VLLM_MOE_W2_CUBIT_DIR=/cubit-share

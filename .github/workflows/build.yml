@@ -32,5 +32,5 @@ jobs:
           file: Dockerfile.sm120-v024
           platforms: linux/amd64
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/vllm-moet-sm120:v024
+          tags: ghcr.io/${{ github.repository_owner }}/vllm-moet-sm120:v024s
           provenance: false
