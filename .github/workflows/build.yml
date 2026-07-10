@@ -2,7 +2,7 @@ name: Build SM120 image and push to GHCR
 on:
   push:
     branches: [main]
-    paths: ['Dockerfile.sm120-v024', 'patch/**', 'kernels/**', '.github/workflows/build.yml']
+    paths: ['Dockerfile.sm120-v024', 'patch/**', 'kernels/**', 'tools/**', '.github/workflows/build.yml']
   workflow_dispatch:
 jobs:
   build:

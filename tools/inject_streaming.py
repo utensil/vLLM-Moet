@@ -76,7 +76,8 @@ STAGE_ANCHOR = ('''            for pname in ("w13_weight", "w13_weight_scale",
                 p_.data = p_.data.cpu()''')
 assert STAGE_ANCHOR in mopt_src, "create_weights .cpu() staging anchor not found"
 STREAM_SETUP = STAGE_ANCHOR + '''
-            if os.getenv("VLLM_MOE_W2_STREAM", "0") == "1":
+            import os as _os_strm
+            if _os_strm.getenv("VLLM_MOE_W2_STREAM", "0") == "1":
                 import re as _re_s
                 _m_s = _re_s.search(r"\\.layers\\.(\\d+)\\.",
                                     getattr(layer, "layer_name", "") or "")
@@ -99,8 +100,6 @@ STREAM_SETUP = STAGE_ANCHOR + '''
                                 return _wl_s
                             _p_s.weight_loader = _mk_s(_real_s, _idx_s)'''
 mopt_src = mopt_src.replace(STAGE_ANCHOR, STREAM_SETUP, 1)
-# ensure `import os` present in modelopt (it is, but be safe)
-assert "import os" in mopt_src, "os import missing in modelopt"
 
 # ---- 3. modelopt.py process_weights: guard against double-build (fail-safe) ----
 PW_ANCHOR = ('''            key = len(moe_w2_cubit._LAYERS)
